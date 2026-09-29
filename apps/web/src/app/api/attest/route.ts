@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Serverless ATTESTER (no standing backend — 00-strategy). Holds the allowlisted attester
  * secret (server-only ATTESTER_SECRET_KEY), VERIFIES a real action, then returns its
  * ed25519 SIGNATURE over the quest_registry's canonical award payload, which names the
@@ -168,8 +168,7 @@ async function verifyEvidence(
   ev: AttestEvidence,
   recipient: string,
 ): Promise<{ ok: boolean; reason?: string; retryable?: boolean; statusCode?: number }> {
-  // Invite-converts (growth quest): the person you invited has opened a profile AND been
-  // vouched for — i.e. their Social score is > 0. Verified by reading the Reputation contract.
+  // Invite-converts (growth quest): the person you invited must have claimed a vouch
   // minted by the recipient. A Social score alone is not enough — any vouched wallet
   // could be unrelated to the inviter. The RPC only retains a limited event window, so a
   // no-match result can also mean the claim happened too far back to see.
@@ -381,7 +380,10 @@ async function readReferralMarker(
   }
 
   const raw = acct.data?.[REFERRAL_MARKER_KEY];
-  return raw ? { type: 'marker', value: decodeDataEntry(raw) } : { type: 'no-marker' };
+  if (!raw) return { type: 'no-marker' };
+  
+  const decoded = decodeDataEntry(raw);
+  return decoded ? { type: 'marker', value: decoded } : { type: 'no-marker' };
 }
 
 /**
@@ -469,3 +471,4 @@ async function claimedVouchFrom(repId: string, from: string, claimer: string): P
   await scanVouchClaimed(repId, (c) => (found = c.from === from && c.claimer === claimer));
   return found;
 }
+
