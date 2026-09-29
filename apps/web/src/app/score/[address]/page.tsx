@@ -13,13 +13,16 @@ interface ScorePageProps {
   params: Promise<{ address: string }>;
 }
 
+// A bare title: the root template adds " · alvinmunk" (appending it here doubled it, #204).
+// No `openGraph` either — it would replace the root's default card; Next fills og:title and
+// og:description from these two.
 export async function generateMetadata({ params }: ScorePageProps): Promise<{
   title: string;
   description: string;
 }> {
   const { address } = await params;
   return {
-    title: `Reputation: ${shortAddr(address)} · alvinmunk`,
+    title: `Reputation: ${shortAddr(address)}`,
     description: `View the on-chain reputation for ${address} — Social XP, Earned XP, and quest attestations.`,
   };
 }
@@ -87,7 +90,7 @@ export default async function ScorePage({ params }: ScorePageProps) {
         <Crest address={address} size={64} points={Math.min(9, 4 + (people.vouchedBy % 5))} />
         <div>
           <p className="font-mono text-sm text-muted-foreground">{shortAddr(address)}</p>
-          <p className="mt-1 text-xs text-muted-foreground/70">
+          <p className="mt-1 text-xs text-muted-foreground">
             {address.startsWith('C') ? 'Passkey wallet (C…)' : 'Classic wallet (G…)'}
           </p>
         </div>

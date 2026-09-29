@@ -158,7 +158,10 @@ install funnel).
 
 A half-card is minted by `from` for an unknown recipient, bound to an ed25519
 claim key (`mint_vouch_signed`) or, on the legacy path, to `sha256(secret)`
-(`mint_vouch`). Both emit this same event.
+(`mint_vouch`). Both emit this same event. A batch mint (`mint_vouches`, see
+[Batch mint](#batch-mint-mint_vouches)) emits it once per card, in card order, each
+right after that card's `social` stake debit — exactly the events of the same cards
+minted one `mint_vouch_signed` call at a time, all in one transaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -221,7 +224,7 @@ Both paths store `slashed: true` on the vouch and emit the same event shape:
 | 1 | `Address` | `from` — the voucher whose stake was slashed |
 | 2 | `u64` | `stake` — the slashed amount |
 
-**Contract source**: `reputation/src/lib.rs` → `fn mint()` (shared by `mint_vouch_signed` / `mint_vouch`) / `fn settle_claim()` (shared by `claim_vouch_signed` / `claim_vouch`) / `fn expire_vouch()`
+**Contract source**: `reputation/src/lib.rs` → `fn mint()` (shared by `mint_vouch_signed` / `mint_vouches` / `mint_vouch`) / `fn settle_claim()` (shared by `claim_vouch_signed` / `claim_vouch`) / `fn expire_vouch()`
 
 ```rust
 // Mint:
@@ -588,7 +591,9 @@ env.events().publish(
 ### `gate` / `created`
 
 An access gate is defined or replaced by the admin, with `create_gate` (one rule) or
-`create_gate_rules` (a composite gate). Both emit the same event.
+`create_gate_rules` (a composite gate). Both emit the same event. For an id that already
+exists it marks a new definition: the gate's version (`get_gate_version`) goes up by one
+and unlocks made under the previous definition stop counting.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -603,7 +608,10 @@ An access gate is defined or replaced by the admin, with `create_gate` (one rule
 
 ### `unlocked`
 
-A user claims a gate they pass, recording on-chain proof of unlock.
+A user claims a gate they pass, recording on-chain proof of unlock. The proof holds for the
+definition the gate had at that moment: a later `gate`/`created` for the same `id`
+supersedes it (the user must `unlock` again), and it doesn't count while the gate is
+inactive. See `UnlockRecord` below for the stored record.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -850,8 +858,8 @@ pub struct Vouch {
 }
 ```
 
-`mint_vouch_signed(from, claim_key, note)` and `mint_vouch(from, claim_hash, note)` revert
-with `NoteTooLong` (#12) when `note` is over 240 bytes (not characters: `ş` is 2 bytes, most emoji 4). That is the web app's
+`mint_vouch_signed(from, claim_key, note)`, `mint_vouch(from, claim_hash, note)` and every
+card of `mint_vouches` revert with `NoteTooLong` (#12) when `note` is over 240 bytes (not characters: `ş` is 2 bytes, most emoji 4). That is the web app's
 60-character limit at UTF-8's worst case, so a note typed there always fits. Vouches
 minted before the cap keep their note as stored.
 
@@ -881,7 +889,8 @@ address instead:
    persistent entry `DataKey::ClaimPubkey(id)` (storage key
    `Vec[Symbol("ClaimPubkey"), U64(id)]`, TTL bumped with the `Vouch` at mint), the card's
    `claim_hash` is 32 zero bytes, and the event is the usual `vouch` / `minted`. Stake,
-   daily cap and note cap are the same as `mint_vouch` (the daily cap counts both).
+   daily cap and note cap are the same as `mint_vouch` (the daily cap counts every mint
+   entrypoint). `mint_vouches` mints several such cards at once (next section).
 2. **Share.** The link is `/claim/<id>#k=<seed as 64 hex chars>`. The seed rides in the URL
    fragment, which browsers never send to a server; the app keeps a local copy for re-sharing.
 3. **Claim.** The claimer's browser signs the claim message below with the seed and calls
@@ -934,6 +943,36 @@ in the link can sign.
 front-runnable until claimed or expired. `mint_vouch` still works for integrations but
 mints the same front-runnable kind; the web app only calls `mint_vouch_signed`. Upgrade
 the contract before shipping a web build that calls it.
+
+### Batch mint (`mint_vouches`)
+
+`mint_vouches(from, claim_keys: Vec<BytesN<32>>, notes: Vec<String>) -> Vec<u64>` lets a
+cohort leader mint several claim-key cards under **one** `from.require_auth()` (one wallet
+prompt). Card `i` is bound to `claim_keys[i]` with note `notes[i]`; the ids come back in
+the same order and are consecutive (nothing else can mint inside the same invocation).
+
+Each card goes through exactly the path of a separate `mint_vouch_signed(from, claim_keys[i],
+notes[i])` call: the note cap, one slot of the voucher's `MAX_VOUCH_PER_DAY` (20 per UTC day,
+shared with single mints), the starter grant (once), one `VOUCH_STAKE` escrow, the stored
+`Vouch` and `ClaimPubkey` entries with the same TTLs, and its own `social` debit and
+`vouch` / `minted` events. Each card claims on its own with `claim_vouch_signed` and the
+seed in its own link, so an indexer or the feed cannot tell a batch from single mints.
+
+| Error | Code | When |
+|-------|------|------|
+| `LengthMismatch` | #14 | `claim_keys` and `notes` differ in length |
+| `BadBatchSize` | #15 | no cards, or more than `MAX_BATCH_VOUCH` (10) |
+| `NoteTooLong` / `DailyCapReached` / `InsufficientStake` | #12 / #9 / #11 | any one card fails its single-mint check |
+
+Any failure reverts the **whole** batch — no card is minted, no stake escrowed, no daily
+slot used, no event emitted. So 19 mints earlier in the day plus a batch of 2 reverts with
+`DailyCapReached` rather than minting one card, and the starter 20 Social XP covers a batch
+of four, not five. A full batch of ten 240-byte notes writes 24 ledger entries (two per
+card, plus the day's count, the balance, the contract instance and the auth nonce) and
+~3 KB of events, far inside the per-transaction limits. `mint_vouches` is new in this upgrade:
+a deployment that predates it has no such function, so upgrade the contract before
+shipping a web build that calls it. The web app calls it from the "Several people" mode
+of the vouch composer (`mintVouches` in `apps/web/src/lib/reputation.ts`).
 
 ### `Profile` (`get_profile`)
 
@@ -1083,6 +1122,23 @@ pub struct QuestConfig {
     pub active: bool,
 }
 ```
+
+### Quest completion (`is_completed` / `get_completed`)
+
+`is_completed(quest_id, who) -> bool` reads the replay guard `award_quest` sets, the
+persistent entry `DataKey::Claimed(quest_id, who)`: `true` once `who` has been awarded the
+quest, and from then on another award for the pair reverts with `AlreadyClaimed` (#5). An
+unknown quest, or an award that reverted, reads as `false`.
+
+`get_completed(who, ids: Vec<u32>) -> Vec<bool>` is the batched form for one wallet: one
+flag per id, in input order, duplicates repeated. Each id is one persistent read, so keep a
+call to the few quests a page shows (the web app asks for its three). Both are pure reads
+that any caller can make, and they don't extend the entry's TTL.
+
+A contract deployed before these views has neither; treat a failed call as "unknown". The
+web app then shows every quest as available, and `/api/attest` goes on to verify the
+evidence as before, since the on-chain guard still refuses a second award. With the views,
+`/api/attest` answers `409` for a completed quest before it verifies any evidence.
 
 ### Quest attester scope (`get_quest_attester`)
 
@@ -1272,6 +1328,30 @@ pub struct RewardInfo {
 }
 ```
 
+### Reward status per wallet (`get_rewards_for`)
+
+```rust
+pub struct RewardStatus {
+    pub entry: RewardInfo, // the `get_rewards` row
+    pub claimed: bool,     // `is_claimed(entry.id, who)`
+    pub eligible: bool,    // reason == 0
+    pub reason: u32,       // the Error code `claim_reward` would revert with; 0 = none
+}
+
+pub fn get_rewards_for(who: Address) -> (Vec<RewardStatus>, i128)
+```
+
+One simulation for a wallet's whole reward table: every row of `get_rewards` (inactive
+ones included, in the same order) with `who`'s status, and the treasury budget left
+today in stroops — `get_daily_cap() - get_daily_paid()`, floored at `0`, or `-1` when no
+daily cap is set. `reason` runs `claim_reward`'s checks in its order without the
+transfer, so it is the first error the claim would revert with: `Paused` (#5), `Frozen`
+(#10), `NotFunded` (#12), `RewardInactive` (#7), `AlreadyClaimed` (#4), `RewardExhausted`
+(#13), `BelowThreshold` (#3), `QuestRegistryNotSet` (#19), `StreakTooShort` (#18), then
+`DailyCapExceeded` (#9). The first three are per wallet and so the same on every row. The
+Earned-XP and streak cross-reads run at most once per call. The view is read-only and
+takes no auth. A contract deployed before this view has no `get_rewards_for`.
+
 ### Daily cap (`get_daily_cap` / `get_daily_paid`)
 
 Both return `i128` USDC stroops. `get_daily_cap()` is the treasury's max payout per UTC
@@ -1331,7 +1411,8 @@ pub struct GateRules {
 `Gate`, which it writes active with the first rule's `track`/`min`. It reverts with
 `EmptyRules` (#8) for no rules, `TooManyRules` (#7) for more than `MAX_RULES` (4), and
 `BadTrack` (#6) for a track other than 0 or 1. Replacing a composite gate with
-`create_gate` drops its rule set. Replacing a gate either way keeps existing unlocks.
+`create_gate` drops its rule set. Replacing a gate either way starts a new definition, so
+its existing unlocks stop counting (see `UnlockRecord`).
 
 `get_gate_rules(id) -> Option<GateRules>` returns `None` for an unknown gate. A gate
 created by `create_gate`, or before composite gates existed, has no stored set and reads
@@ -1339,6 +1420,33 @@ as one `AllOf` rule built from its `Gate` fields. `check`/`unlock` read each rep
 track at most once per call, however many rules name it. A contract deployed before
 composite gates has no `get_gate_rules` or `create_gate_rules`; its gates keep working
 unchanged after an upgrade.
+
+### `UnlockRecord` (`get_unlock` / `is_unlocked` / `get_gate_version`)
+
+```rust
+pub struct UnlockRecord {
+    pub version: u32, // the gate's version when it was unlocked
+    pub ledger: u32,  // ledger sequence of the unlock
+}
+```
+
+`unlock` stores this under `Unlocked(addr, id)`; unlocking again replaces it.
+`get_gate_version(id) -> u32` counts the gate's redefinitions: `0` for a gate never
+replaced (and for an unknown id), `+1` on every `create_gate` / `create_gate_rules` for an
+existing id — including one that keeps the same rules. `set_gate_active` is not a
+redefinition and leaves the version alone.
+
+`is_unlocked(addr, id) -> bool` is true only while the gate is active **and** the stored
+record's `version` equals `get_gate_version(id)`, so an unlock earned under a weaker rule,
+or on another track, no longer reads as an unlock of the current gate. Disabling a gate
+hides its unlocks; re-enabling it without a redefinition brings them back.
+`get_unlock(addr, id) -> Option<UnlockRecord>` returns the latest record whether or not it
+still counts (`None` if `addr` never unlocked `id`).
+
+Before these records existed, `Unlocked` held a bare `true`. After an upgrade such an entry
+reads as `{ version: 0, ledger: 0 }`: it keeps counting until the gate's first
+redefinition, and the next `unlock` replaces it with a record. A contract deployed before
+this change has no `get_unlock` or `get_gate_version`.
 
 ---
 

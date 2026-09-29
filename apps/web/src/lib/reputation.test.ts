@@ -13,6 +13,10 @@ const { invokeMock, REP_ID, TESTNET } = vi.hoisted(() => ({
 }));
 
 vi.mock('./stellar', () => ({ networkPassphrase: TESTNET }));
+// The profile and vouch reads go through the app's @alvinmunk/sdk client (its own tests pin
+// the views, arguments and decoding against a mocked RPC); here it is a stub.
+const sdkMock = vi.hoisted(() => ({ getProfile: vi.fn(), getVouch: vi.fn() }));
+vi.mock('./sdk', () => ({ readClient: () => sdkMock }));
 vi.mock('./contracts', () => ({
   repId: () => REP_ID,
   questId: () => 'CQUESTID',
@@ -25,6 +29,8 @@ vi.mock('./contracts', () => ({
     u64: (n: number) => ({ __u64: n }),
     str: (s: string) => ({ __str: s }),
     bytes: (b: Uint8Array) => ({ __bytes: b }),
+    bytesVec: (bs: Uint8Array[]) => ({ __bytesVec: bs }),
+    strs: (ss: string[]) => ({ __strs: ss }),
   },
 }));
 
@@ -38,6 +44,7 @@ import {
   clampVouchNote,
   isClaimCode,
   mintVouch,
+  mintVouches,
   parseClaimCode,
   signClaim,
   fromHex,
@@ -46,6 +53,8 @@ import {
   getPending,
   getProfile,
   getScores,
+  getVouch,
+  VOUCH_BATCH_MAX,
   VOUCH_NOTE_MAX_BYTES,
   VOUCH_NOTE_MAX_CHARS,
   vouchNoteBytes,
@@ -136,49 +145,85 @@ describe('vouch note limit', () => {
 });
 
 describe('getProfile', () => {
-  beforeEach(() => readPublicMock.mockReset());
-
-  it('maps the aggregate view to a typed ProfileView', async () => {
-    readPublicMock.mockResolvedValueOnce({ social: 30n, earned: 50n, verified: true });
-    const p = await getProfile('GADDR');
-    expect(p).toEqual({ social: 30, earned: 50, verified: true });
-    expect(readPublicMock).toHaveBeenCalledWith(REP_ID, 'get_profile', expect.any(Array));
+  beforeEach(() => {
+    readPublicMock.mockReset();
+    sdkMock.getProfile.mockReset();
   });
 
-  it('defaults missing fields to zero/false', async () => {
-    readPublicMock.mockResolvedValueOnce(undefined);
+  it("reads the SDK's profile of the address", async () => {
+    sdkMock.getProfile.mockResolvedValueOnce({ social: 30, earned: 50, verified: true });
     const p = await getProfile('GADDR');
-    expect(p).toEqual({ social: 0, earned: 0, verified: false });
+    expect(p).toEqual({ social: 30, earned: 50, verified: true });
+    expect(sdkMock.getProfile).toHaveBeenCalledWith('GADDR');
+    expect(readPublicMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the profile cannot be read, so callers never show made-up zeros', async () => {
+    const down = new Error('simulate get_profile failed: fetch failed');
+    sdkMock.getProfile.mockRejectedValueOnce(down);
+    await expect(getProfile('GADDR')).rejects.toBe(down);
   });
 
   it('shares one get_profile read between widgets asking at the same time', async () => {
-    readPublicMock.mockResolvedValue({ social: 1n, earned: 2n, verified: true });
+    sdkMock.getProfile.mockResolvedValue({ social: 1, earned: 2, verified: true });
     const [a, b] = await Promise.all([getProfile('GADDR'), getProfile('GADDR')]);
     expect(a).toEqual(b);
-    expect(readPublicMock).toHaveBeenCalledTimes(1);
+    expect(sdkMock.getProfile).toHaveBeenCalledTimes(1);
     await getProfile('GADDR'); // settled → the next read is fresh
-    expect(readPublicMock).toHaveBeenCalledTimes(2);
+    expect(sdkMock.getProfile).toHaveBeenCalledTimes(2);
   });
 });
 
 describe('getScores', () => {
-  beforeEach(() => readPublicMock.mockReset());
+  beforeEach(() => sdkMock.getProfile.mockReset());
 
-  it('prefers the single get_profile call (1 round-trip)', async () => {
-    readPublicMock.mockResolvedValueOnce({ social: 15n, earned: 5n, verified: false });
+  it('takes both tracks from the single get_profile read (1 round-trip)', async () => {
+    sdkMock.getProfile.mockResolvedValueOnce({ social: 15, earned: 5, verified: false });
     const s = await getScores('GADDR');
     expect(s).toEqual({ social: 15, earned: 5 });
-    expect(readPublicMock).toHaveBeenCalledTimes(1);
+    expect(sdkMock.getProfile).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to get_score + get_earned when get_profile is unavailable', async () => {
-    readPublicMock
-      .mockRejectedValueOnce(new Error('unknown method get_profile'))
-      .mockResolvedValueOnce(12n) // get_score
-      .mockResolvedValueOnce(8n); // get_earned
-    const s = await getScores('GADDR');
-    expect(s).toEqual({ social: 12, earned: 8 });
-    expect(readPublicMock).toHaveBeenCalledTimes(3);
+  it('shares the read with a getProfile caller asking at the same time', async () => {
+    sdkMock.getProfile.mockResolvedValue({ social: 3, earned: 4, verified: true });
+    const [p, s] = await Promise.all([getProfile('GADDR'), getScores('GADDR')]);
+    expect(p).toEqual({ social: 3, earned: 4, verified: true });
+    expect(s).toEqual({ social: 3, earned: 4 });
+    expect(sdkMock.getProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it('never rejects: an unreadable profile scores zero', async () => {
+    sdkMock.getProfile.mockRejectedValueOnce(new Error('fetch failed'));
+    await expect(getScores('GADDR')).resolves.toEqual({ social: 0, earned: 0 });
+  });
+});
+
+describe('getVouch', () => {
+  beforeEach(() => sdkMock.getVouch.mockReset());
+
+  const card = {
+    id: 7,
+    from: 'GFROM',
+    note: 'hi',
+    claimed: false,
+    claimer: null,
+    created: 1,
+    stake: 5,
+    slashed: false,
+  };
+
+  it("reads the SDK's half-card, null for an unknown id", async () => {
+    sdkMock.getVouch.mockResolvedValueOnce(card).mockResolvedValueOnce(null);
+    await expect(getVouch(7)).resolves.toEqual(card);
+    await expect(getVouch(8)).resolves.toBeNull();
+    expect(sdkMock.getVouch.mock.calls).toEqual([[7], [8]]);
+  });
+
+  it('shares one read per id between cards scanning the same vouch at once', async () => {
+    sdkMock.getVouch.mockResolvedValue(card);
+    const [a, b] = await Promise.all([getVouch(7), getVouch(7)]);
+    expect(a).toBe(b);
+    expect(sdkMock.getVouch).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -304,6 +349,38 @@ describe('vouch mint and claim', () => {
     // Every mint gets its own key.
     const again = await mintVouch(wallet, 'gm');
     expect(again.seed).not.toBe(seed);
+  });
+
+  it('batch-mints one fresh claim key per note in a single call, in order', async () => {
+    invokeMock.mockResolvedValue([4n, 5n, 6n]);
+    const cards = await mintVouches(wallet, ['ada', 'grace', 'linus']);
+
+    expect(cards.map((c) => c.id)).toEqual([4, 5, 6]);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    const [contract, method, callArgs, signer] = invokeMock.mock.calls[0];
+    expect([contract, method, signer]).toEqual([REP_ID, 'mint_vouches', wallet]);
+    expect(callArgs[0]).toEqual({ __addr: CLASSIC });
+    expect(callArgs[2]).toEqual({ __strs: ['ada', 'grace', 'linus'] });
+    // Card i is bound to the public half of seed i; the seeds stay here.
+    const keys = (callArgs[1] as { __bytesVec: Uint8Array[] }).__bytesVec;
+    expect(keys).toEqual(cards.map((c) => claimPublicKey(fromHex(c.seed))));
+    for (const c of cards) expect(isClaimCode(c.seed)).toBe(true);
+    expect(new Set(cards.map((c) => c.seed)).size).toBe(3);
+    expect(JSON.stringify(invokeMock.mock.calls)).not.toContain(cards[0].seed);
+  });
+
+  it('refuses an empty or oversized batch before asking the wallet to sign', async () => {
+    expect(VOUCH_BATCH_MAX).toBe(10);
+    await expect(mintVouches(wallet, [])).rejects.toThrow('1 to 10');
+    await expect(mintVouches(wallet, Array(VOUCH_BATCH_MAX + 1).fill('gm'))).rejects.toThrow('not 11');
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it('passes a reverted batch through, and rejects a result that does not match the notes', async () => {
+    invokeMock.mockRejectedValueOnce(new Error('HostError: Error(Contract, #9)'));
+    await expect(mintVouches(wallet, ['a', 'b'])).rejects.toThrow('#9');
+    invokeMock.mockResolvedValueOnce([4n]);
+    await expect(mintVouches(wallet, ['a', 'b'])).rejects.toThrow('unexpected result');
   });
 
   it('claims with a signature for the wallet, never the seed itself', async () => {
