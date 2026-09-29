@@ -12,6 +12,8 @@
  *   - "status codes" (issue #180): every status-code branch of the handler itself — config,
  *     body size, rate limit, input validation, evidence shape/verification, signing, and the
  *     happy path (signature verified cryptographically).
+ *   - "upstream failures" (issue #173): GitHub or Horizon timing out, unreachable, rate-limited
+ *     or down is a retryable 5xx, never a 422 (which says the evidence is wrong).
  */
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { Address, Keypair, Networks, StrKey, nativeToScVal, rpc } from '@stellar/stellar-sdk';
@@ -267,83 +269,18 @@ describe('POST /api/attest referral_tx via the registry invite binding', () => {
     });
   });
 
-  it('503 with retryable when Horizon read fails (issue #173 fix)', async () => {
+  it('reports a Horizon read failure distinctly from having no binding at all', async () => {
     // invited_by resolves to null (no registry binding); the manageData fallback then
-    // hits Horizon, which returns a non-404 error — must now be 503 with retryable, not 422.
+    // hits Horizon, which returns a non-404 error — that must read as an upstream failure
+    // (#173), not be folded into "no referral binding found".
     fetchSpy.mockResolvedValue(new Response('rate limited', { status: 503 }));
     simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
     const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
     expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/horizon unavailable.*503/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  // ── issue #173: Horizon timeouts, network failures and upstream outages ───
-
-  it('504 with retryable when Horizon times out', async () => {
-    const timeoutError = new Error('The operation was aborted due to timeout');
-    timeoutError.name = 'TimeoutError';
-    fetchSpy.mockRejectedValueOnce(timeoutError);
-    simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
-    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(504);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/horizon timed out/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when Horizon fetch rejects (network failure, DNS)', async () => {
-    fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'));
-    simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
-    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/couldn't reach horizon/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when Horizon returns 500 (upstream outage)', async () => {
-    fetchSpy.mockResolvedValueOnce(new Response('internal error', { status: 500 }));
-    simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
-    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/horizon unavailable.*500/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when Horizon returns 503 (service unavailable)', async () => {
-    fetchSpy.mockResolvedValueOnce(new Response('service unavailable', { status: 503 }));
-    simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
-    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/horizon unavailable.*503/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when Horizon returns invalid JSON', async () => {
-    fetchSpy.mockResolvedValueOnce(new Response('not json', { status: 200 }));
-    simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
-    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/invalid data/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('422 for Horizon 404 (account does not exist) — valid no-referral-binding flow', async () => {
-    // A 404 from Horizon means the account doesn't exist — that's a valid "no marker"
-    // answer (type: 'no-marker'), not an upstream failure. judgeReferral then correctly
-    // returns "no referral binding found" as a 422.
-    fetchSpy.mockResolvedValueOnce(new Response('not found', { status: 404 }));
-    simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
-    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(422);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/no referral binding found/i);
-    expect(body.retryable).toBeUndefined();
+    expect(await res.json()).toEqual({
+      error: 'horizon unavailable (503) — try again',
+      retryable: true,
+    });
   });
 });
 
@@ -505,7 +442,7 @@ describe('POST /api/attest — status codes (issue #180)', () => {
     expect(body.error).toMatch(/not merged/i);
   });
 
-  it('422 when GitHub API returns 404 (PR does not exist)', async () => {
+  it('422 when GitHub API returns non-200', async () => {
     vi.resetModules();
     vi.stubEnv('QUEST_GITHUB_ID', '1');
     ({ POST } = (await import('./route')) as { POST: Post });
@@ -514,95 +451,6 @@ describe('POST /api/attest — status codes (issue #180)', () => {
     expect(res.status).toBe(422);
     const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/github 404/i);
-  });
-
-  // ── issue #173: GitHub timeouts, network failures and upstream outages ────
-
-  it('503 with retryable when GitHub fetch times out', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    const timeoutError = new Error('The operation was aborted due to timeout');
-    timeoutError.name = 'TimeoutError';
-    fetchSpy.mockRejectedValueOnce(timeoutError);
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/timed out/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when GitHub fetch rejects (network error, DNS failure)', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockRejectedValueOnce(new Error('network error'));
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/couldn't reach github/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when GitHub returns 403 (rate limit without token)', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response('rate limit exceeded', { status: 403 }));
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/github unavailable.*403/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when GitHub returns 429 (rate limit with token)', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    vi.stubEnv('GITHUB_TOKEN', 'ghp_test123');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response('rate limit exceeded', { status: 429 }));
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/github unavailable.*429/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when GitHub returns 500 (upstream outage)', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response('internal server error', { status: 500 }));
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/github unavailable.*500/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when GitHub returns 503 (service unavailable)', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response('service unavailable', { status: 503 }));
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/github unavailable.*503/i);
-    expect(body.retryable).toBe(true);
-  });
-
-  it('503 with retryable when GitHub returns invalid JSON', async () => {
-    vi.resetModules();
-    vi.stubEnv('QUEST_GITHUB_ID', '1');
-    ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response('not json at all', { status: 200 }));
-    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/invalid data/i);
-    expect(body.retryable).toBe(true);
   });
 
   // ── signing: local, never fed by an RPC node (issue #142) ───────────────────
@@ -718,3 +566,130 @@ describe('POST /api/attest — status codes (issue #180)', () => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// Suite — upstream failures (issue #173)
+// ══════════════════════════════════════════════════════════════════════════
+// The two evidence checks that call fetch: github_pr (GitHub's PR API) and referral_tx's
+// manageData fallback (Horizon). Their evidence failures — a 404, an unmerged PR, a missing
+// or mismatched marker — stay 422 and are covered above.
+
+describe('POST /api/attest — upstream failures (issue #173)', () => {
+  const upstreams = [
+    {
+      upstream: 'github',
+      async setup() {
+        vi.resetModules();
+        vi.stubEnv('QUEST_GITHUB_ID', '1');
+        ({ POST } = (await import('./route')) as { POST: Post });
+      },
+      request: { questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } },
+    },
+    {
+      upstream: 'horizon',
+      async setup() {
+        // A wallet with a score and no registry binding: the manageData marker decides.
+        simulateSpy.mockResolvedValueOnce(score(5));
+      },
+      request: { questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } },
+    },
+  ] as const;
+
+  describe.each(upstreams)('$upstream', ({ upstream, setup, request }) => {
+    beforeEach(setup);
+
+    it('504 when the connection stalls, cut off by the timeout', async () => {
+      // A fetch that never settles on its own: only its signal can end it. The route's
+      // 8 s timeout is shortened to 5 ms here; the rejection is Node's own TimeoutError.
+      const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => realTimeout(5));
+      fetchSpy.mockImplementationOnce(
+        (_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      );
+      const res = await attest(request);
+      expect(timeoutSpy).toHaveBeenCalledWith(8_000);
+      expect(res.status).toBe(504);
+      expect(await res.json()).toEqual({
+        error: `${upstream} timed out — try again`,
+        retryable: true,
+      });
+    });
+
+    it('504 when the body stalls past the timeout', async () => {
+      const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      const stalled = new ReadableStream({ start: (c) => c.error(timeout) });
+      fetchSpy.mockResolvedValueOnce(new Response(stalled, { status: 200 }));
+      const res = await attest(request);
+      expect(res.status).toBe(504);
+      expect(await res.json()).toEqual({
+        error: `${upstream} timed out — try again`,
+        retryable: true,
+      });
+    });
+
+    it('503 when fetch rejects (DNS failure, connection reset) — a JSON answer, not a throw', async () => {
+      fetchSpy.mockRejectedValueOnce(new TypeError('fetch failed'));
+      const res = await attest(request);
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({
+        error: `couldn’t reach ${upstream} right now — try again`,
+        retryable: true,
+      });
+    });
+
+    it.each([403, 429, 500, 503])('503 when it answers %i (rate limit, outage)', async (status) => {
+      fetchSpy.mockResolvedValueOnce(new Response('{"message":"nope"}', { status }));
+      const res = await attest(request);
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({
+        error: `${upstream} unavailable (${status}) — try again`,
+        retryable: true,
+      });
+    });
+
+    it('502 on any other unexpected status, still not a 422', async () => {
+      fetchSpy.mockResolvedValueOnce(new Response('{"message":"bad"}', { status: 401 }));
+      const res = await attest(request);
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        error: `${upstream} unavailable (401) — try again`,
+        retryable: true,
+      });
+    });
+
+    it('502 when a 200 answer is not JSON', async () => {
+      fetchSpy.mockResolvedValueOnce(new Response('<html>maintenance</html>', { status: 200 }));
+      const res = await attest(request);
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        error: `${upstream} sent an unreadable answer — try again`,
+        retryable: true,
+      });
+    });
+  });
+
+  it('a Horizon outage does not hide that the referred wallet has no score yet', async () => {
+    // judgeReferral decides on the score first: with none, Horizon's answer can't matter.
+    simulateSpy.mockResolvedValueOnce(score(0));
+    fetchSpy.mockRejectedValueOnce(new TypeError('fetch failed'));
+    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      error: 'that wallet hasn’t done anything here yet — no referral credit',
+    });
+  });
+
+  it('still sends GITHUB_TOKEN with the timed GitHub read', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_test');
+    ({ POST } = (await import('./route')) as { POST: Post });
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ merged: true }), { status: 200 }));
+    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
+    expect(res.status).toBe(200);
+    const init = fetchSpy.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>).authorization).toBe('Bearer ghp_test');
+  });
+});
