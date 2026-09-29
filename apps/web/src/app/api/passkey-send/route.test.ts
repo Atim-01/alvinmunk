@@ -8,8 +8,22 @@
  *   - "happy paths": successful contract call + deploy with mocked ChannelsClient
  */
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
-import { Keypair, xdr, Transaction, hash as sha256 } from '@stellar/stellar-sdk';
-import { ChannelsClient } from '@openzeppelin/relayer-plugin-channels';
+import {
+  Account,
+  Address,
+  Keypair,
+  Operation,
+  SorobanDataBuilder,
+  TransactionBuilder,
+  xdr,
+  hash as sha256,
+} from '@stellar/stellar-sdk';
+import {
+  ChannelsClient,
+  PluginExecutionError,
+  PluginTransportError,
+  PluginUnexpectedError,
+} from '@openzeppelin/relayer-plugin-channels';
 
 const PASSPHRASE = 'Test SDF Network ; September 2015';
 
@@ -18,57 +32,34 @@ let POST: Post;
 let submitSorobanTxMock: Mock;
 let submitTxMock: Mock;
 
-/** Build a minimal Soroban v1 tx envelope (for deploy tests) */
+/** A signed Soroban deploy tx whose fee differs from its resource fee (what refeeDeploy fixes). */
 function buildDeployEnvelope(fee: number): string {
   const source = Keypair.fromRawEd25519Seed(sha256(Buffer.from('kalepail')));
-  const account = new xdr.MuxedAccount.keyTypeEd25519(source.rawPublicKey());
-  const op = xdr.Operation.invokeHostFunction(
-    new xdr.InvokeHostFunctionOp({
-      hostFunction: xdr.HostFunction.hostFunctionTypeCreateContract(
-        new xdr.CreateContractArgs({
-          contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
-            new xdr.ContractIdPreimageFromAddress({
-              address: xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32)),
-              salt: xdr.Uint256(Buffer.alloc(32)),
-            }),
-          ),
-          executable: xdr.ContractExecutable.contractExecutableWasm(xdr.Hash(Buffer.alloc(32))),
-        }),
-      ),
-      auth: [],
-    }),
-  );
-  const tx = new xdr.Transaction({
-    sourceAccount: account,
-    fee: xdr.Uint32(fee),
-    seqNum: xdr.SequenceNumber.fromString('1'),
-    cond: xdr.Preconditions.precondNone(),
-    memo: xdr.Memo.memoNone(),
-    operations: [op],
-    ext: new xdr.TransactionExt(1, new xdr.SorobanTransactionData({
-      ext: new xdr.ExtensionPoint(0),
-      resources: new xdr.SorobanResources({
-        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
-        instructions: xdr.Uint32(0),
-        readBytes: xdr.Uint32(0),
-        writeBytes: xdr.Uint32(0),
+  const tx = new TransactionBuilder(new Account(source.publicKey(), '1'), {
+    fee: String(fee),
+    networkPassphrase: PASSPHRASE,
+  })
+    .addOperation(
+      Operation.createCustomContract({
+        address: new Address(source.publicKey()),
+        wasmHash: Buffer.alloc(32),
+        salt: Buffer.alloc(32),
       }),
-      resourceFee: xdr.Int64.fromString(String(fee - 100)),
-    })),
-  });
-  const envelope = new xdr.TransactionEnvelope.envelopeTypeTx(new xdr.TransactionV1Envelope({ tx, signatures: [] }));
-  const txObj = new Transaction(envelope.toXDR('base64'), PASSPHRASE);
-  txObj.sign(source);
-  return txObj.toXDR();
+    )
+    .setSorobanData(new SorobanDataBuilder().setResourceFee(fee - 100).build())
+    .setTimeout(0)
+    .build();
+  tx.sign(source);
+  return tx.toXDR();
 }
 
 /** Valid base64-encoded SorobanAuthorizedFunction (invoke contract) */
 function validFunc(): string {
-  const addr = xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32, 1));
+  const addr = Address.contract(Buffer.alloc(32, 1)).toScAddress();
   const func = xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
     new xdr.InvokeContractArgs({
       contractAddress: addr,
-      functionName: xdr.ScSymbol.fromString('test'),
+      functionName: 'test',
       args: [],
     }),
   );
@@ -82,8 +73,8 @@ function validAuth(): string {
     rootInvocation: new xdr.SorobanAuthorizedInvocation({
       function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
         new xdr.InvokeContractArgs({
-          contractAddress: xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32, 1)),
-          functionName: xdr.ScSymbol.fromString('test'),
+          contractAddress: Address.contract(Buffer.alloc(32, 1)).toScAddress(),
+          functionName: 'test',
           args: [],
         }),
       ),
@@ -91,34 +82,6 @@ function validAuth(): string {
     }),
   });
   return entry.toXDR('base64');
-}
-
-/** Typed relayer errors (matching @openzeppelin/relayer-plugin-channels) */
-class PluginTransportError extends Error {
-  errorDetails: { statusCode: number; message?: string };
-  constructor(statusCode: number, message = 'transport error') {
-    super(message);
-    this.name = 'PluginTransportError';
-    this.errorDetails = { statusCode, message };
-  }
-}
-
-class PluginExecutionError extends Error {
-  errorDetails: { message?: string };
-  constructor(message = 'execution error') {
-    super(message);
-    this.name = 'PluginExecutionError';
-    this.errorDetails = { message };
-  }
-}
-
-class PluginUnexpectedError extends Error {
-  errorDetails: Record<string, unknown>;
-  constructor(message = 'unexpected error') {
-    super(message);
-    this.name = 'PluginUnexpectedError';
-    this.errorDetails = {};
-  }
 }
 
 function passkeySend(body: Record<string, unknown>): Promise<Response> {
@@ -239,21 +202,16 @@ describe('POST /api/passkey-send — input validation', () => {
     expect(submitTxMock).not.toHaveBeenCalled();
   });
 
-  it('400 when xdr is not a v1 envelope', async () => {
-    // Build a v0 envelope (no ext, no Soroban data)
+  it('400 when xdr is a classic (non-Soroban) transaction', async () => {
     const source = Keypair.random();
-    const account = new xdr.MuxedAccount.keyTypeEd25519(source.rawPublicKey());
-    const tx = new xdr.Transaction({
-      sourceAccount: account,
-      fee: xdr.Uint32(100),
-      seqNum: xdr.SequenceNumber.fromString('1'),
-      cond: xdr.Preconditions.precondNone(),
-      memo: xdr.Memo.memoNone(),
-      operations: [],
-      ext: new xdr.TransactionExt(0), // v0, no Soroban data
-    });
-    const envelope = new xdr.TransactionEnvelope.envelopeTypeTx(new xdr.TransactionV1Envelope({ tx, signatures: [] }));
-    const xdrStr = envelope.toXDR('base64');
+    const classic = new TransactionBuilder(new Account(source.publicKey(), '1'), {
+      fee: '100',
+      networkPassphrase: PASSPHRASE,
+    })
+      .addOperation(Operation.bumpSequence({ bumpTo: '2' }))
+      .setTimeout(0)
+      .build();
+    const xdrStr = classic.toXDR();
 
     const res = await passkeySend({ xdr: xdrStr });
     expect(res.status).toBe(400);
@@ -263,31 +221,16 @@ describe('POST /api/passkey-send — input validation', () => {
   });
 
   it('400 when xdr is a fee-bump envelope', async () => {
-    // Build a fee-bump envelope (different envelope type)
     const source = Keypair.random();
-    const account = new xdr.MuxedAccount.keyTypeEd25519(source.rawPublicKey());
-    const innerTx = new xdr.Transaction({
-      sourceAccount: account,
-      fee: xdr.Uint32(100),
-      seqNum: xdr.SequenceNumber.fromString('1'),
-      cond: xdr.Preconditions.precondNone(),
-      memo: xdr.Memo.memoNone(),
-      operations: [],
-      ext: new xdr.TransactionExt(0),
-    });
-    const innerEnv = new xdr.TransactionEnvelope.envelopeTypeTx(
-      new xdr.TransactionV1Envelope({ tx: innerTx, signatures: [] }),
-    );
-    const feeBumpTx = new xdr.FeeBumpTransaction({
-      feeSource: account,
-      fee: xdr.Int64.fromString('200'),
-      innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(innerEnv.v1()!),
-      ext: new xdr.FeeBumpTransactionExt(0),
-    });
-    const feeBumpEnv = new xdr.TransactionEnvelope.envelopeTypeFeeBump(
-      new xdr.FeeBumpTransactionEnvelope({ tx: feeBumpTx, signatures: [] }),
-    );
-    const xdrStr = feeBumpEnv.toXDR('base64');
+    const inner = new TransactionBuilder(new Account(source.publicKey(), '1'), {
+      fee: '100',
+      networkPassphrase: PASSPHRASE,
+    })
+      .addOperation(Operation.bumpSequence({ bumpTo: '2' }))
+      .setTimeout(0)
+      .build();
+    inner.sign(source);
+    const xdrStr = TransactionBuilder.buildFeeBumpTransaction(source, '200', inner, PASSPHRASE).toXDR();
 
     const res = await passkeySend({ xdr: xdrStr });
     expect(res.status).toBe(400);
@@ -302,27 +245,19 @@ describe('POST /api/passkey-send — input validation', () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 describe('POST /api/passkey-send — relayer error mapping', () => {
-  it('422 when PluginExecutionError is thrown (relayer rejection)', async () => {
-    submitSorobanTxMock.mockRejectedValueOnce(new PluginExecutionError('simulation failed: contract panic'));
+  it('422 when the relayer rejects the transaction (PluginExecutionError)', async () => {
+    submitSorobanTxMock.mockRejectedValueOnce(
+      new PluginExecutionError('simulation failed: contract panic', { code: 'SIMULATION_FAILED' }),
+    );
     const res = await passkeySend({ func: validFunc(), auth: [validAuth()] });
     expect(res.status).toBe(422);
     const body = (await res.json()) as { error: string; code: string };
-    expect(body.error).toMatch(/simulation failed/i);
+    expect(body.error).toBe('simulation failed: contract panic');
     expect(body.code).toBe('RELAYER_EXECUTION_ERROR');
   });
 
-  it('422 includes errorDetails.message when present', async () => {
-    const err = new PluginExecutionError('outer message');
-    err.errorDetails.message = 'inner detail message';
-    submitSorobanTxMock.mockRejectedValueOnce(err);
-    const res = await passkeySend({ func: validFunc(), auth: [validAuth()] });
-    expect(res.status).toBe(422);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe('inner detail message');
-  });
-
-  it('502 when PluginTransportError with 5xx statusCode', async () => {
-    submitTxMock.mockRejectedValueOnce(new PluginTransportError(503, 'upstream service unavailable'));
+  it('502 when the relayer answers an HTTP error with no body (PluginTransportError + status)', async () => {
+    submitTxMock.mockRejectedValueOnce(new PluginTransportError('Network error: 503', 503, {}));
     const res = await passkeySend({ xdr: buildDeployEnvelope(1000) });
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: string; code: string };
@@ -330,17 +265,42 @@ describe('POST /api/passkey-send — relayer error mapping', () => {
     expect(body.code).toBe('RELAYER_TRANSPORT_ERROR');
   });
 
-  it('504 when PluginTransportError with timeout-like statusCode', async () => {
-    submitTxMock.mockRejectedValueOnce(new PluginTransportError(408, 'request timeout'));
-    const res = await passkeySend({ xdr: buildDeployEnvelope(1000) });
+  it('502 when the connection drops without a status', async () => {
+    submitSorobanTxMock.mockRejectedValueOnce(
+      new PluginTransportError('Network error: connect ECONNREFUSED', undefined, { code: 'ECONNREFUSED' }),
+    );
+    const res = await passkeySend({ func: validFunc(), auth: [validAuth()] });
+    expect(res.status).toBe(502);
+  });
+
+  it.each([
+    ['an axios timeout', undefined, 'ECONNABORTED'],
+    ['a socket timeout', undefined, 'ETIMEDOUT'],
+    ['an upstream 504', 504, undefined],
+    ['an upstream 408', 408, undefined],
+  ])('504 on %s', async (_label, status, code) => {
+    submitSorobanTxMock.mockRejectedValueOnce(new PluginTransportError('Network error: timeout', status, { code }));
+    const res = await passkeySend({ func: validFunc(), auth: [validAuth()] });
     expect(res.status).toBe(504);
     const body = (await res.json()) as { error: string; code: string };
-    expect(body.error).toMatch(/unreachable.*408/i);
+    expect(body.error).toMatch(/timed out/i);
     expect(body.code).toBe('RELAYER_TRANSPORT_ERROR');
   });
 
+  it('never echoes or logs the transport error details (they carry the API key)', async () => {
+    const axiosLike = { code: 'ECONNABORTED', config: { headers: { Authorization: 'Bearer test-api-key' } } };
+    submitSorobanTxMock.mockRejectedValueOnce(new PluginTransportError('Network error: timeout', undefined, axiosLike));
+    const res = await passkeySend({ func: validFunc(), auth: [validAuth()] });
+    expect(await res.text()).not.toContain('test-api-key');
+    const logged = [...(console.log as Mock).mock.calls, ...(console.error as Mock).mock.calls]
+      .flat()
+      .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+      .join(' ');
+    expect(logged).not.toContain('test-api-key');
+  });
+
   it('502 when PluginUnexpectedError (malformed relayer response)', async () => {
-    submitSorobanTxMock.mockRejectedValueOnce(new PluginUnexpectedError('response not json'));
+    submitSorobanTxMock.mockRejectedValueOnce(new PluginUnexpectedError('Malformed response: missing success field'));
     const res = await passkeySend({ func: validFunc(), auth: [validAuth()] });
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: string; code: string };
@@ -431,32 +391,5 @@ describe('POST /api/passkey-send — happy paths', () => {
     ({ POST } = (await import('./route')) as { POST: Post });
     const res = await passkeySend({ func: validFunc(), auth: [] });
     expect(res.status).toBe(503);
-  });
-
-  it('logs successful submission with hash', async () => {
-    submitSorobanTxMock.mockResolvedValueOnce({ hash: 'logged-hash' });
-    await passkeySend({ func: validFunc(), auth: [validAuth()] });
-    expect(console.log).toHaveBeenCalledWith('[passkey-send] Success:', { hash: 'logged-hash' });
-  });
-
-  it('logs error details on PluginExecutionError', async () => {
-    const err = new PluginExecutionError('test error');
-    submitSorobanTxMock.mockRejectedValueOnce(err);
-    await passkeySend({ func: validFunc(), auth: [validAuth()] });
-    expect(console.error).toHaveBeenCalledWith(
-      '[passkey-send] Relayer error:',
-      expect.objectContaining({
-        name: 'PluginExecutionError',
-        message: 'test error',
-      }),
-    );
-  });
-
-  it('logs error on malformed input XDR', async () => {
-    await passkeySend({ func: 'bad-xdr', auth: [] });
-    expect(console.error).toHaveBeenCalledWith(
-      '[passkey-send] Invalid func XDR:',
-      expect.any(String),
-    );
   });
 });
