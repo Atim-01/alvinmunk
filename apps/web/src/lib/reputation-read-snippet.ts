@@ -60,5 +60,9 @@ async function read(method) {
 
 const social = await read('get_score'); // Social XP: from vouches, never cashable
 const earned = await read('get_earned'); // Earned XP: from verified quests, the USDC-eligible track
-console.log({ social, earned }); // u64 decodes to BigInt, e.g. { social: 15n, earned: 0n }`;
+
+// Stars (the product's headline unit): one star per 10 Social XP, floor of 1
+const stars = Math.max(1, Math.round(social / 10));
+
+console.log({ social, earned, stars }); // e.g. { social: 15n, earned: 0n, stars: 2 }`;
 }

@@ -12,6 +12,7 @@ import {
   buildClaimPath,
   buildClaimUrl,
   shortAddr,
+  starsFromSocial,
   type SocialRecord,
 } from './index';
 
@@ -223,5 +224,46 @@ describe('share links', () => {
   });
   it('shortens addresses', () => {
     expect(shortAddr('GABCDEFGHIJKLMNOP')).toBe('GABC…MNOP');
+  });
+});
+
+describe('starsFromSocial', () => {
+  it('has a floor of 1 for 0 XP (so everyone has at least one star)', () => {
+    expect(starsFromSocial(0)).toBe(1);
+  });
+
+  it('keeps the floor of 1 for 1–4 XP (below the first full star)', () => {
+    expect(starsFromSocial(1)).toBe(1);
+    expect(starsFromSocial(4)).toBe(1);
+  });
+
+  it('rounds to 1 star at the 5 XP boundary (halfway to 10)', () => {
+    expect(starsFromSocial(5)).toBe(1);
+  });
+
+  it('awards 2 stars at 15 XP', () => {
+    expect(starsFromSocial(15)).toBe(2);
+  });
+
+  it('calculates stars correctly for typical values', () => {
+    expect(starsFromSocial(10)).toBe(1); // exactly 1 star
+    expect(starsFromSocial(14)).toBe(1); // rounds down
+    expect(starsFromSocial(20)).toBe(2); // exactly 2 stars
+    expect(starsFromSocial(24)).toBe(2); // rounds down
+    expect(starsFromSocial(25)).toBe(3); // rounds up from 2.5
+    expect(starsFromSocial(50)).toBe(5); // exactly 5 stars
+    expect(starsFromSocial(99)).toBe(10); // 9.9 rounds to 10
+    expect(starsFromSocial(100)).toBe(10); // exactly 10 stars
+  });
+
+  it('handles large values', () => {
+    expect(starsFromSocial(1000)).toBe(100);
+    expect(starsFromSocial(9999)).toBe(1000);
+  });
+
+  it('uses standard rounding (0.5 rounds up)', () => {
+    expect(starsFromSocial(25)).toBe(3); // 2.5 → 3
+    expect(starsFromSocial(35)).toBe(4); // 3.5 → 4
+    expect(starsFromSocial(24)).toBe(2); // 2.4 → 2
   });
 });

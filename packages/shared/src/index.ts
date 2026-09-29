@@ -299,3 +299,21 @@ export function shortAddr(address: string, lead = 4, tail = 4): string {
   if (address.length <= lead + tail + 1) return address;
   return `${address.slice(0, lead)}…${address.slice(-tail)}`;
 }
+
+// ── Stars (the product's headline reputation unit) ──
+
+/**
+ * Convert Social XP to stars — the product's headline unit shown on profiles, cards,
+ * and the dashboard. One star per 10 Social XP, with a floor of 1 so every profile
+ * shows at least one star (0–4 XP → 1 star, 5–14 → 1 star, 15–24 → 2 stars, etc.).
+ * 
+ * This is the single source of truth for the stars calculation. Previously scattered
+ * across six call sites with two different floors, causing users to see different
+ * star counts in different places.
+ * 
+ * @param social - Social XP (non-negative integer)
+ * @returns Number of stars (minimum 1)
+ */
+export function starsFromSocial(social: number): number {
+  return Math.max(1, Math.round(social / 10));
+}
