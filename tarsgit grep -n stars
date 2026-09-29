@@ -1,0 +1,20 @@
+[35mapps/web/src/app/api/attest/route.ts[m[36m:[m[32m259[m[36m:[m  const startLedger = [1;31mMath.max[m(1, latest.sequence - EVENT_WINDOW);
+[35mapps/web/src/app/api/stats/route.ts[m[36m:[m[32m103[m[36m:[m  const startLedger = [1;31mMath.max[m(1, latest - LIVE_WINDOW);
+[35mapps/web/src/app/claim/[id]/page.tsx[m[36m:[m[32m107[m[36m:[m  const daysLeft = vouch ? [1;31mMath.max[m(0, Math.ceil((deadline - nowSec) / 86_400)) : 0;
+[35mapps/web/src/components/Rewards.tsx[m[36m:[m[32m133[m[36m:[m              const left = cap > 0 ? [1;31mMath.max[m(0, cap - (r.claims ?? 0)) : null;
+[35mapps/web/src/components/brand/constellation-3d.tsx[m[36m:[m[32m201[m[36m:[m  const count = [1;31mMath.max[m(vouchedBy ?? 0, shown);
+[35mapps/web/src/components/brand/constellation-parts.tsx[m[36m:[m[32m67[m[36m:[m    const r = Math.sqrt([1;31mMath.max[m(0, 1 - y * y));
+[35mapps/web/src/components/brand/starfield.tsx[m[36m:[m[32m75[m[36m:[m      const count = [1;31mMath.max[m(60, Math.min(440, Math.floor((w * h) / 5500)));
+[35mapps/web/src/components/ui/progress-ring.tsx[m[36m:[m[32m19[m[36m:[m  const clamped = [1;31mMath.max[m(0, Math.min(1, value));
+[35mapps/web/src/lib/admin.ts[m[36m:[m[32m224[m[36m:[m  const left = cap > 0 ? ` ${[1;31mMath.max[m(0, cap - (r.claims ?? 0))} of ${cap} claims are left.` : '';
+[35mapps/web/src/lib/badges.ts[m[36m:[m[32m260[m[36m:[m    vouchedBy: [1;31mMath.max[m(seen.vouchedBy.length, counts?.vouchedBy ?? 0),
+[35mapps/web/src/lib/badges.ts[m[36m:[m[32m261[m[36m:[m    vouchedFor: [1;31mMath.max[m(seen.vouchedFor.length, counts?.backed ?? 0),
+[35mapps/web/src/lib/constellation.ts[m[36m:[m[32m63[m[36m:[m    vouchedBy: [1;31mMath.max[m(onchain?.vouchedBy ?? 0, recent.vouchedBy.length),
+[35mapps/web/src/lib/constellation.ts[m[36m:[m[32m64[m[36m:[m    backed: [1;31mMath.max[m(onchain?.backed ?? 0, recent.vouchedFor.length),
+[35mapps/web/src/lib/constellation.ts[m[36m:[m[32m71[m[36m:[m  const s = [1;31mMath.max[m(0, Math.floor(Date.now() / 1000) - unixSecs);
+[35mapps/web/src/lib/events.ts[m[36m:[m[32m108[m[36m:[m    startLedger = [1;31mMath.max[m(1, latest.sequence - EVENT_LEDGER_WINDOW);
+[35mapps/web/src/lib/myvouches.ts[m[36m:[m[32m65[m[36m:[m        daysLeft: [1;31mMath.max[m(0, Math.ceil((deadline - now) / 86_400)),
+[35mapps/web/src/lib/reputation-read-snippet.ts[m[36m:[m[32m65[m[36m:[mconst stars = [1;31mMath.max[m(1, Math.round(social / 10));
+[35mapps/web/src/lib/vouch-funnel.ts[m[36m:[m[32m205[m[36m:[m  for (let id = [1;31mMath.max[m(1, total - MAX_VOUCH_READS + 1); id <= total; id += KEYS_PER_REQUEST) {
+[35mpackages/shared/src/index.ts[m[36m:[m[32m318[m[36m:[m  return [1;31mMath.max[m(1, Math.round(social / 10));
+[35mscripts/freeze-rings.mjs[m[36m:[m[32m79[m[36m:[m  const startLedger = [1;31mMath.max[m(1, latest.sequence - 9000); // within RPC retention (≥16k returns 0)
