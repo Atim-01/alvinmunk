@@ -416,7 +416,10 @@ changes nothing and emits no event.
 
 A handle is freed: the wallet released it (`release()`), or renamed away from
 it (`claim()` with a different handle, emitted right before the new `claimed`).
-Either way the handle no longer resolves and anyone may claim it.
+Either way the handle no longer resolves and enters a 30-day cooldown
+(`HANDLE_COOLDOWN_SECS`): until `until` only this wallet may claim it again, and
+`claim()` by anyone else reverts with `HandleCoolingDown` (#9). From `until` on,
+anyone may claim it.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -429,18 +432,53 @@ Either way the handle no longer resolves and anyone may claim it.
 |-------|------|-------------|
 | 0 | `Address` | `caller` — the wallet that held the handle |
 | 1 | `Symbol` | `handle` — the freed handle |
+| 2 | `u64` | `until` — ledger timestamp (unix seconds) the cooldown ends at |
 
-An indexer keyed by handle stays in sync by applying both sub-types in event
-order: `claimed` sets `handle → caller`, `released` deletes `handle`. The one
-gap is `admin_release()` (see the note below).
+Index 2 was appended when handle cooldowns landed; readers that only look at
+indexes 0–1 are unaffected. A registry deployed before then emits two fields and
+has no cooldown.
 
-**Contract source**: `registry/src/lib.rs` → `fn claim()` / `fn release()`
+### `handle` / `moved`
+
+A handle moves from one wallet to another in a single call (`transfer_handle()`),
+signed by both. It is never free in between, so no `released` or `claimed` is
+emitted for it and it starts no cooldown. When `from` had a profile, `meta` / `cleared` for `from` and
+`meta` / `set` for `to` follow in the same transaction: the profile moves with
+the handle.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **topics[0]** | `Symbol("handle")` | Event discriminator |
+| **topics[1]** | `Symbol("moved")` | Sub-type |
+
+**Data tuple**:
+
+| Index | Type | Description |
+|-------|------|-------------|
+| 0 | `Address` | `from` — the wallet that held the handle (now holds none) |
+| 1 | `Address` | `to` — the wallet that holds it now |
+| 2 | `Symbol` | `handle` — the moved handle |
+
+`transfer_handle(from, to)` needs `from`'s and `to`'s authorization for that exact
+call, so a handle can't be pushed onto an address that didn't accept it. It
+reverts with `NoHandle` (#4) when `from` holds no handle and `AlreadyHasHandle`
+(#10) when `to` already holds one (`to == from` included). Social and Earned XP
+stay with `from`: they live in the Reputation contract, keyed by address.
+
+An indexer keyed by handle stays in sync by applying all three sub-types in event
+order: `claimed` sets `handle → caller` (ending any cooldown on it), `released`
+deletes `handle` and marks it reserved for `caller` until `until`, `moved` sets
+`handle → to`. One keyed by address maps `to → handle` and drops `from` on
+`moved`. The one gap is `admin_release()` (see the note below); the `cooldown`
+read view is always current.
+
+**Contract source**: `registry/src/lib.rs` → `fn claim()` / `fn release()` / `fn transfer_handle()`
 
 ```rust
 // Rename (inside claim, before the claimed event):
 env.events().publish(
     (symbol_short!("handle"), symbol_short!("released")),
-    (caller.clone(), old));
+    (caller.clone(), old, until));
 
 // Claim:
 env.events().publish(
@@ -450,18 +488,26 @@ env.events().publish(
 // Release:
 env.events().publish(
     (symbol_short!("handle"), symbol_short!("released")),
-    (caller, handle));
+    (caller.clone(), handle, until));
+
+// Transfer:
+env.events().publish(
+    (symbol_short!("handle"), symbol_short!("moved")),
+    (from.clone(), to.clone(), handle));
 ```
 
 > **Note**: `admin_release()` does **not** emit a `handle` event (admin-only
 > operation that cleans up state silently). It does emit `meta` / `cleared` when
-> the holder had a profile.
+> the holder had a profile. It frees the handle outright: it starts no cooldown,
+> and silently ends one the handle is already in.
 
 ### `meta` / `set`
 
 A handle holder publishes its profile face and bio (`set_meta()`), replacing any
 earlier ones. Only an address that holds a handle can set one; a rename keeps it.
-The stored shape is [`ProfileMeta`](#profilemeta-get_meta).
+Also emitted for `to` by `transfer_handle()` when the profile moves with the
+handle (right after `meta` / `cleared` for `from`). The stored shape is
+[`ProfileMeta`](#profilemeta-get_meta).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -472,16 +518,17 @@ The stored shape is [`ProfileMeta`](#profilemeta-get_meta).
 
 | Index | Type | Description |
 |-------|------|-------------|
-| 0 | `Address` | `caller` — the handle holder |
+| 0 | `Address` | `caller` — the handle holder (`to` for a transfer) |
 | 1 | `u64` | `avatar` — the packed face (layout under `ProfileMeta`) |
 | 2 | `String` | `bio` — plain text, may be empty |
 
 ### `meta` / `cleared`
 
 An address's profile is deleted because it gave up its handle: `release()`
-(right after `handle` / `released`) or `admin_release()`. Emitted only when there
-was a profile to delete. Meta is keyed by address, so whoever claims the freed
-handle next starts with none.
+(right after `handle` / `released`), `admin_release()`, or `transfer_handle()`
+(right after `handle` / `moved`, followed by `meta` / `set` for the new wallet).
+Emitted only when there was a profile to delete. Meta is keyed by address, so
+whoever claims a freed handle next starts with none.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -505,9 +552,14 @@ env.events().publish(
     (symbol_short!("meta"), symbol_short!("set")),
     (caller, avatar, bio));
 
-// Cleared (from release / admin_release):
+// Cleared (from release / admin_release / transfer_handle):
 env.events().publish(
     (symbol_short!("meta"), symbol_short!("cleared")), addr);
+
+// Moved with a transfer (after cleared for `from`):
+env.events().publish(
+    (symbol_short!("meta"), symbol_short!("set")),
+    (to, meta.avatar, meta.bio));
 ```
 
 ---
@@ -516,7 +568,8 @@ env.events().publish(
 
 ### `gate` / `created`
 
-An access gate is defined by the admin.
+An access gate is defined or replaced by the admin, with `create_gate` (one rule) or
+`create_gate_rules` (a composite gate). Both emit the same event.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -544,7 +597,7 @@ A user claims a gate they pass, recording on-chain proof of unlock.
 |------|-------------|
 | `u32` | `id` — the gate ID |
 
-**Contract source**: `gate/src/lib.rs` → `fn create_gate()` / `fn unlock()`
+**Contract source**: `gate/src/lib.rs` → `fn put_gate()` (via `create_gate()` / `create_gate_rules()`) / `fn unlock()`
 
 ```rust
 // Create:
@@ -705,7 +758,7 @@ Quick-reference table of all event discriminators and their sub-types.
 | `quest` | `created`, `awarded`, `att_bind`, `att_clear` | QuestRegistry | [↑](#2-questregistry-contract) |
 | `streak` | *(none)* | QuestRegistry | [↑](#streak-weekly-retention) |
 | `att_key` | `budget`, `near_cap` | QuestRegistry | [↑](#att_key--budget-attester-budget-set) |
-| `handle` | `claimed`, `released` | Registry | [↑](#3-registry-contract-handles) |
+| `handle` | `claimed`, `released`, `moved` | Registry | [↑](#3-registry-contract-handles) |
 | `meta` | `set`, `cleared` | Registry | [↑](#meta--set) |
 | `gate` | `created` | Gate | [↑](#4-gate-contract) |
 | `unlocked` | *(none)* | Gate | [↑](#unlocked) |
@@ -935,12 +988,33 @@ All three are pure reads: any caller, no auth, no writes, no TTL extension. A re
 deployed before `reverse_many` has no such function (`Error(WasmVm, MissingValue)`,
 "non-existent contract function"), so fall back to one `reverse` per address.
 
+### Handle cooldown (`cooldown`)
+
+`cooldown(handle) -> Option<CooldownInfo>` says why a free handle can't be claimed yet:
+it was released or renamed away less than 30 days (`HANDLE_COOLDOWN_SECS`) ago.
+
+```rust
+pub struct CooldownInfo {
+    pub prev_owner: Address,  // the wallet that freed it; it may reclaim it any time
+    pub until: u64,           // ledger timestamp (unix seconds) anyone may claim it from
+}
+```
+
+`None` when the handle is held, was never freed, its cooldown has passed, or
+`admin_release` lifted it. While it is `Some`, `claim(handle)` by any address other
+than `prev_owner` reverts with `HandleCoolingDown` (#9). The window is checked against
+ledger time only, and the entry lives in temporary storage (about 60 days of ledgers)
+so it outlives `until` and then deletes itself. Pure read: any caller, no writes, no
+TTL extension. A registry deployed before cooldowns has no such function, so treat a
+failed call as "no cooldown".
+
 ### `ProfileMeta` (`get_meta`)
 
 `get_meta(addr) -> Option<ProfileMeta>` returns the profile `addr` published with
-`set_meta` (`DataKey::Meta(addr)`), or `None` if it never set one or has since given
-up its handle. A registry deployed before `set_meta` has no `get_meta`, so treat a
-failed call as "no profile" and show the default face.
+`set_meta` or received along with a handle from `transfer_handle`
+(`DataKey::Meta(addr)`), or `None` if it has none or has since given up its handle.
+A registry deployed before `set_meta` has no `get_meta`, so treat a failed call as
+"no profile" and show the default face.
 
 ```rust
 pub struct ProfileMeta {
@@ -1126,6 +1200,42 @@ pub struct Gate {
     pub active: bool,
 }
 ```
+
+For a composite gate, `track`/`min` hold its **first** rule only. `check` and `unlock`
+evaluate the whole rule set, so read `get_gate_rules` before describing what a gate
+requires.
+
+### Composite gates (`get_gate_rules`)
+
+```rust
+pub struct Rule {
+    pub track: u32, // 0 = Social, 1 = Earned
+    pub min: u64,
+}
+
+pub enum RuleMode {
+    AllOf = 0, // every rule must pass
+    AnyOf = 1, // at least one rule must pass
+}
+
+pub struct GateRules {
+    pub rules: Vec<Rule>,
+    pub mode: RuleMode, // encoded as a u32
+}
+```
+
+`create_gate_rules(id, rules, mode, label)` stores the set under its own key next to the
+`Gate`, which it writes active with the first rule's `track`/`min`. It reverts with
+`EmptyRules` (#8) for no rules, `TooManyRules` (#7) for more than `MAX_RULES` (4), and
+`BadTrack` (#6) for a track other than 0 or 1. Replacing a composite gate with
+`create_gate` drops its rule set. Replacing a gate either way keeps existing unlocks.
+
+`get_gate_rules(id) -> Option<GateRules>` returns `None` for an unknown gate. A gate
+created by `create_gate`, or before composite gates existed, has no stored set and reads
+as one `AllOf` rule built from its `Gate` fields. `check`/`unlock` read each reputation
+track at most once per call, however many rules name it. A contract deployed before
+composite gates has no `get_gate_rules` or `create_gate_rules`; its gates keep working
+unchanged after an upgrade.
 
 ---
 

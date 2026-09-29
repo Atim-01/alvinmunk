@@ -13,12 +13,16 @@
  * never touches feature code.
  */
 import {
+  Address,
   Contract,
   Keypair,
   StrKey,
   TransactionBuilder,
+  authorizeEntry,
   hash as sha256,
   scValToNative,
+  xdr,
+  type Transaction,
 } from '@stellar/stellar-sdk';
 import {
   isConnected as freighterIsConnected,
@@ -27,9 +31,38 @@ import {
   signMessage as freighterSignMessage,
 
 } from '@stellar/freighter-api';
-import { config, networkPassphrase, waitForAccountReady, server } from './stellar';
+import {
+  accountExists,
+  assertNetworkConfig,
+  config,
+  networkPassphrase,
+  waitForAccountReady,
+  server,
+} from './stellar';
+import { getItem, setItem, remove } from './storage';
 
 export type WalletKind = 'passkey' | 'dev' | 'freighter' | 'albedo' | 'kit';
+
+/**
+ * How to establish a wallet:
+ *  - `create` (default): the wallet this browser has on record — resuming a pending deploy —
+ *    or, with none, enroll a NEW passkey and deploy its wallet.
+ *  - `recover`: an EXISTING wallet only (issue #278). The passkey is picked in a WebAuthn
+ *    prompt (synced ones included), so a returning user on a new phone, a second browser or
+ *    after clearing site data reaches the SAME account instead of silently getting a fresh,
+ *    empty one. Never enrolls or deploys; throws `AccountNotFoundError` when there is none.
+ */
+export type ConnectMode = 'create' | 'recover';
+
+/** A `recover` connect found no existing wallet. Nothing was created, nothing stored changed. */
+export class AccountNotFoundError extends Error {
+  constructor(
+    message = 'No account found for that passkey — create a new one, or use the device where you first signed up.',
+  ) {
+    super(message);
+    this.name = 'AccountNotFoundError';
+  }
+}
 
 export interface Wallet {
   kind: WalletKind;
@@ -50,8 +83,20 @@ export interface Wallet {
   invoke?: (
     contractId: string,
     method: string,
-    args: import('@stellar/stellar-sdk').xdr.ScVal[],
+    args: xdr.ScVal[],
+    /** Called with the prepared call before this wallet signs it, to add a co-signer's
+     * auth entries (a two-party call like `transfer_handle`; see `invokeCosigned`). */
+    cosign?: (prepared: Transaction) => Promise<Transaction>,
   ) => Promise<{ hash: string; value: unknown }>;
+  /**
+   * Sign this wallet's authorization entry of a call ANOTHER wallet submits (the second
+   * signature of a two-party call like `transfer_handle`), valid until `validUntilLedger`.
+   * Only wallets that hold their key in this browser (the dev wallet) can co-sign.
+   */
+  signAuthEntry?: (
+    entry: xdr.SorobanAuthorizationEntry,
+    validUntilLedger: number,
+  ) => Promise<xdr.SorobanAuthorizationEntry>;
 }
 
 function u8ToB64(u8: Uint8Array): string {
@@ -86,9 +131,19 @@ export function isPasskeyConfigured(): boolean {
   return Boolean(process.env.NEXT_PUBLIC_PASSKEY_WALLET_WASM_HASH);
 }
 
-/** Pick the right provider. Passkey when configured; dev otherwise (testnet only). */
-export async function getWallet(): Promise<Wallet> {
-  if (isPasskeyConfigured()) return connectPasskey();
+/**
+ * Pick the right provider. Passkey when configured; dev otherwise (testnet only). Like every
+ * connect below, it refuses on an inconsistent network config: no wallet, no transaction — and
+ * no passkey wallet deployed, nor dev wallet funded, on the wrong network.
+ */
+export async function getWallet(mode: ConnectMode = 'create'): Promise<Wallet> {
+  assertNetworkConfig();
+  if (isPasskeyConfigured()) return connectPasskey(mode);
+  // The dev wallet lives only in this browser's storage: with none stored there is nothing to
+  // recover, and minting one would hand the returning user a fresh, empty account.
+  if (mode === 'recover' && !safeLocalGet(DEV_SECRET_KEY)) {
+    throw new AccountNotFoundError('No wallet on this device to restore.');
+  }
   return getDevWallet();
 }
 
@@ -101,14 +156,38 @@ export async function getDevWallet(): Promise<Wallet> {
   const existing = safeLocalGet(DEV_SECRET_KEY);
   const kp = existing ? Keypair.fromSecret(existing) : Keypair.random();
 
-  if (!existing) {
-    safeLocalSet(DEV_SECRET_KEY, kp.secret());
+  // Persist the key before funding so every retry reuses one address, and decide whether
+  // to fund from on-chain state: a key saved before a failed Friendbot call (or wiped by a
+  // testnet reset) must still get funded on the next try. A fresh key is never funded yet.
+  if (!existing) safeLocalSet(DEV_SECRET_KEY, kp.secret());
+  if (!existing || !(await accountExists(kp.publicKey()))) {
     await fundWithFriendbot(kp.publicKey());
     // Friendbot may return before the RPC sees the new account; wait so the first
     // getAccount in the onboarding flow doesn't 404.
     await waitForAccountReady(kp.publicKey());
   }
 
+  return devWallet(kp);
+}
+
+/**
+ * The dev wallet this browser already has, or null — never creates or funds one. For
+ * flows about an existing key, like moving its @handle to another wallet. Like every other
+ * way to get a wallet, it refuses on an inconsistent network config.
+ */
+export function storedDevWallet(): Wallet | null {
+  assertNetworkConfig();
+  if (config.network === 'mainnet') return null;
+  const secret = safeLocalGet(DEV_SECRET_KEY);
+  if (!secret) return null;
+  try {
+    return devWallet(Keypair.fromSecret(secret));
+  } catch {
+    return null;
+  }
+}
+
+function devWallet(kp: Keypair): Wallet {
   return {
     kind: 'dev',
     address: kp.publicKey(),
@@ -121,6 +200,8 @@ export async function getDevWallet(): Promise<Wallet> {
       const sig = kp.sign(new TextEncoder().encode(message) as unknown as Buffer);
       return u8ToB64(new Uint8Array(sig));
     },
+    signAuthEntry: (entry, validUntilLedger) =>
+      authorizeEntry(entry, kp, validUntilLedger, networkPassphrase),
   };
 }
 
@@ -160,6 +241,7 @@ function sleep(ms: number): Promise<void> {
 // Satisfies the White-belt Level-1 rubric: Freighter connect/disconnect + signing.
 
 export async function connectFreighter(): Promise<Wallet> {
+  assertNetworkConfig();
   const conn = await freighterIsConnected();
   if (!conn.isConnected) {
     throw new Error('Freighter not detected. Install it from freighter.app, then retry.');
@@ -211,6 +293,7 @@ export function disconnectFreighter(): void {
 // zero-dependency SDK; dynamic-imported so it stays out of the marketing bundle.
 
 export async function connectAlbedo(): Promise<Wallet> {
+  assertNetworkConfig();
   const albedo = (await import('@albedo-link/intent')).default;
   const net = config.network === 'mainnet' ? 'public' : 'testnet';
   const { pubkey } = await albedo.publicKey({});
@@ -339,6 +422,35 @@ function decodePasskeyKey(keyIdB64: string, publicKeyB64: string | null): Passke
 }
 
 /**
+ * passkey-kit deploys every wallet from this deterministic shared source (see PasskeyKit's
+ * constructor). Reproducing it is what makes a rebuilt deploy land — and a recovered passkey
+ * derive — the SAME contract id.
+ */
+function passkeyDeployer(): Keypair {
+  return Keypair.fromRawEd25519Seed(sha256('kalepail'));
+}
+
+/**
+ * The wallet contract a passkey deploys to: the shared deploy source with `hash(keyId)` as salt,
+ * on this network. The same derivation as passkey-kit's (private) `encodeContract`, which
+ * `connectWallet` uses.
+ */
+function passkeyContractId(keyId: Uint8Array): string {
+  const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
+    new xdr.HashIdPreimageContractId({
+      networkId: sha256(networkPassphrase),
+      contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
+        new xdr.ContractIdPreimageFromAddress({
+          address: Address.fromString(passkeyDeployer().publicKey()).toScAddress(),
+          salt: sha256(keyId as Buffer),
+        }),
+      ),
+    }),
+  );
+  return StrKey.encodeContract(sha256(preimage.toXDR()));
+}
+
+/**
  * Build (and deployer-sign) a smart-wallet deploy transaction for an ALREADY-enrolled passkey.
  *
  * `PasskeyKit.createWallet` enrols the passkey and deploys in a single opaque call and persists
@@ -357,9 +469,7 @@ async function buildPasskeyDeploy(
 ): Promise<{ contractId: string; signedXdr: string }> {
   const { PasskeyClient } = await import('passkey-kit');
 
-  // passkey-kit deploys every wallet from this deterministic shared source (see PasskeyKit's
-  // constructor). Reproducing it is what makes the rebuild derive the SAME contract id.
-  const deployer = Keypair.fromRawEd25519Seed(sha256('kalepail'));
+  const deployer = passkeyDeployer();
 
   const at = await PasskeyClient.deploy(
     {
@@ -444,7 +554,33 @@ function clearPasskeyRecord(): void {
   for (const k of [PK_PENDING, PK_KEYID, PK_PUBKEY, PK_CONTRACT]) safeLocalRemove(k);
 }
 
-export async function connectPasskey(): Promise<Wallet> {
+/**
+ * Find the existing wallet of a passkey the user picks (issue #278) and make it this browser's
+ * record; returns its key id. `connectWallet` without a keyId runs a WebAuthn assertion for any
+ * discoverable passkey of this site — synced ones included (iCloud Keychain, Google Password
+ * Manager) — so this works where no record exists, and where the record is for a DIFFERENT
+ * passkey (say, one enrolled here by mistake before choosing "I already have an account").
+ *
+ * Never enrolls or deploys. The record is only replaced once the wallet is confirmed on-chain:
+ * a missing wallet, an RPC failure or a dismissed prompt leave it as it was, so a pending
+ * deploy stays resumable.
+ */
+async function recoverPasskey(kit: import('passkey-kit').PasskeyKit): Promise<string> {
+  // The kit probes its derived contract with `getContractData`, which reports ANY RPC failure
+  // as "not found" and then throws a bare "Failed to connect wallet". Handing the same
+  // derivation back as its fallback leaves the verdict to `passkeyContractExists`, which tells
+  // an RPC blip (throws) from a wallet that isn't there (false).
+  const found = await kit.connectWallet({
+    getContractId: async (keyId) => passkeyContractId(b64uToU8(keyId)),
+  });
+  if (!(await passkeyContractExists(found.contractId))) throw new AccountNotFoundError();
+  clearPasskeyRecord(); // whatever was on record here belongs to another (or an unfinished) wallet
+  safeLocalSet(PK_KEYID, found.keyIdBase64);
+  safeLocalSet(PK_CONTRACT, found.contractId);
+  return found.keyIdBase64;
+}
+
+export async function connectPasskey(mode: ConnectMode = 'create'): Promise<Wallet> {
   const wasmHash = process.env.NEXT_PUBLIC_PASSKEY_WALLET_WASM_HASH;
   if (!wasmHash) {
     throw new Error(
@@ -472,13 +608,14 @@ export async function connectPasskey(): Promise<Wallet> {
   // Returning user → re-derive the wallet from the stored credential (no Mercury needed: the
   // contract id derives on-chain from the keyId; the cached id is a fallback). First run →
   // FaceID/passkey enroll, then persist + deploy + CONFIRM via the relayer before returning —
-  // otherwise the next call would hit an undeployed C… account.
+  // otherwise the next call would hit an undeployed C… account. Recover → the user picks an
+  // existing passkey instead, whatever this browser has on record (see `recoverPasskey`).
   //
   // Enrollment and deploy are deliberately SPLIT. `kit.createWallet` does both in one call and
   // stores nothing in between, so a relayer/confirm failure orphans a passkey the OS has already
   // saved and the app has no record of. Persisting the key material first (with a pendingDeploy
   // marker) is what lets a retry resume with the SAME passkey (issue #186).
-  let storedKeyId = safeLocalGet(PK_KEYID);
+  let storedKeyId = mode === 'recover' ? null : safeLocalGet(PK_KEYID);
   if (storedKeyId && safeLocalGet(PK_PENDING) && !(await resumePasskeyDeploy(storedKeyId, wasmHash))) {
     // The pending record is corrupted and its wallet never landed, so it can't be resumed. Drop
     // it and enroll afresh instead of leaving every later connect stuck on it.
@@ -487,7 +624,9 @@ export async function connectPasskey(): Promise<Wallet> {
   }
 
   let keyId: string;
-  if (storedKeyId) {
+  if (mode === 'recover') {
+    keyId = await recoverPasskey(kit);
+  } else if (storedKeyId) {
     keyId = storedKeyId;
   } else {
     // First run: enroll, then persist key id + public key + the pendingDeploy marker BEFORE we
@@ -516,7 +655,7 @@ export async function connectPasskey(): Promise<Wallet> {
   return {
     kind: 'passkey',
     address: contractId, // a CONTRACT address (C…), not a G… key
-    invoke: async (target, method, callArgs) => {
+    invoke: async (target, method, callArgs, cosign) => {
       // The app SDK (@stellar/stellar-sdk v16) and passkey-kit's bundled SDK (v14) are
       // DIFFERENT package instances, so an AssembledTransaction we build here would fail
       // kit.sign's `instanceof` check and be mis-parsed. We sidestep that by crossing the
@@ -532,7 +671,8 @@ export async function connectPasskey(): Promise<Wallet> {
         .addOperation(new Contract(target).call(method, ...callArgs))
         .setTimeout(180)
         .build();
-      const prepared = await server.prepareTransaction(tx);
+      // A co-signer (two-party call) signs its own entries first; kit.sign only touches ours.
+      const prepared = await server.prepareTransaction(tx).then((p) => cosign?.(p) ?? p);
 
       // Give the passkey-signed AUTH entry a generous expiration ledger (≈ +120 ledgers, ~10
       // min). This is independent of the tx time bounds (the relayer rebuilds those on a
@@ -574,11 +714,11 @@ export async function connectPasskey(): Promise<Wallet> {
 // ── helpers ──
 
 function safeLocalGet(k: string): string | null {
-  return typeof localStorage !== 'undefined' ? localStorage.getItem(k) : null;
+  return getItem(k);
 }
 function safeLocalSet(k: string, v: string): void {
-  if (typeof localStorage !== 'undefined') localStorage.setItem(k, v);
+  setItem(k, v);
 }
 function safeLocalRemove(k: string): void {
-  if (typeof localStorage !== 'undefined') localStorage.removeItem(k);
+  remove(k);
 }
