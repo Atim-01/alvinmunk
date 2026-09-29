@@ -226,7 +226,7 @@ async function verifyEvidence(
       if (e instanceof Error && e.name === 'TimeoutError') {
         return { ok: false, reason: 'github timed out — try again', retryable: true };
       }
-      return { ok: false, reason: 'couldn't reach github right now — try again', retryable: true };
+      return { ok: false, reason: 'couldn\'t reach github right now — try again', retryable: true };
     }
 
     // Upstream rate limit (403 without GITHUB_TOKEN, or 429 with one) or outage (5xx).
@@ -266,7 +266,7 @@ async function verifyEvidence(
         return { ok: false, reason: 'horizon timed out — try again', retryable: true, statusCode: 504 };
       }
       if (markerResult.type === 'network-error') {
-        return { ok: false, reason: 'couldn't reach horizon right now — try again', retryable: true, statusCode: 503 };
+        return { ok: false, reason: 'couldn\'t reach horizon right now — try again', retryable: true, statusCode: 503 };
       }
       if (markerResult.type === 'upstream-error') {
         return {
