@@ -194,8 +194,19 @@ secret (`claim_vouch`). Both emit this same event. See
 
 #### `vouch` / `slashed`
 
-An unclaimed half-card expires after its 7-day window; the staked Social XP
-is forfeit (not refunded).
+A half-card's staked Social XP is forfeit (not refunded). There are **two paths** that
+emit this event:
+
+1. **`expire_vouch` path** — an unclaimed half-card is explicitly slashed by a keeper
+   after its 7-day window. The card remains unclaimed (`claimed: false`).
+2. **Late-claim path** — the card is claimed after its 7-day window but before anyone
+   called `expire_vouch`. In this case `vouch`/`slashed` is emitted **before**
+   `vouch`/`claimed` in the same transaction (the claimer's `social` claim-XP event
+   falls between the two), so indexers see the slash before the claim.
+   The stored vouch records `slashed: true, claimed: true`. A card `expire_vouch` already
+   slashed can still be claimed; that claim emits no second `vouch`/`slashed`.
+
+Both paths store `slashed: true` on the vouch and emit the same event shape:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -217,15 +228,23 @@ is forfeit (not refunded).
 env.events().publish(
     (symbol_short!("vouch"), symbol_short!("minted")), (id, from));
 
-// Claim:
+// Claim (timely — refund, no slash event):
 env.events().publish(
     (symbol_short!("vouch"), symbol_short!("claimed")),
     (vouch_id, vouch.from, claimer));
 
-// Slash:
+// Slash via expire_vouch (unclaimed, past deadline):
 env.events().publish(
     (symbol_short!("vouch"), symbol_short!("slashed")),
     (vouch_id, vouch.from, vouch.stake));
+
+// Late claim (past deadline): slash event emitted BEFORE claimed event.
+env.events().publish(
+    (symbol_short!("vouch"), symbol_short!("slashed")),
+    (vouch_id, vouch.from, vouch.stake));
+env.events().publish(
+    (symbol_short!("vouch"), symbol_short!("claimed")),
+    (vouch_id, vouch.from, claimer));
 ```
 
 ---
@@ -634,6 +653,16 @@ A direct USDC transfer from one wallet to another, with a social
 > topics as filter segments, so a 2-segment `['*', '*']` scan never returns `tipped`. Use a
 > 3-segment filter such as `[tipped, <from>, '*']` (`apps/web/src/lib/events.ts` →
 > `fetchTipsSent`).
+
+> **Invariants (#144)**: every `tipped` event moves value. `tip` reverts with
+> `InvalidAmount` (#8) for an `amount ≤ 0` and with `SelfTip` (#20) when `from == to`, so
+> `amount > 0` and `topics[1] != topics[2]` always hold. Before that rule the SAC accepted a
+> zero amount and a self-transfer, and a wallet could mint unlimited no-value `tipped`
+> events for the price of a fee — enough to fake "received a spend" in the feed and an
+> indexer, which is the Green belt's D7 de-risk metric. A `tipped` event from a contract
+> deployed before this rule is not re-validated; `amount > 0` and distinct wallets are the
+> normal case and only a deliberate abuse looks different. `SelfTip` (#20) sits above the
+> SAC's own 1–13 error range so a code can never be confused with the token contract's.
 
 ### `rwd_set` (Reward Registered/Updated)
 
@@ -1253,6 +1282,15 @@ tightening it (`set_paused(true)` is the way to stop every payout), and with
 `CapBelowActiveReward` (#17) for a positive cap below an active row's `amount`. A negative
 cap stored by a contract deployed before that rule reads as `0`, which is how the payout
 checks always treated it.
+
+### Tip validation (`validate_tip`, in `tip`)
+
+`tip(from, to, amount)` takes no view and emits no event of its own, but the reverts are
+part of the `tipped` contract above: `InvalidAmount` (#8) for `amount ≤ 0` and `SelfTip`
+(#20) for `from == to`. Both are checked before the SAC transfer and before the event, so a
+rejected tip moves nothing and mints nothing. `tip` also requires `from.require_auth()`, is
+gated on `Paused` (#5) and on the sender not being `Frozen` (#10), and never touches the
+treasury — the daily cap counts claims only, since a tip is sender-funded.
 
 ### `Gate`
 
