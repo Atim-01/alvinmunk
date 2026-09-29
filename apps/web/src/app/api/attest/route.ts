@@ -144,7 +144,12 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
 
   // 3) Verify the real-world action (network).
   const verified = await verifyEvidence(body.evidence as AttestEvidence, body.recipient);
-  if (!verified.ok) return json({ error: verified.reason }, 422);
+  if (!verified.ok) {
+    // Upstream timeouts, outages and rate limits get specific status codes with retryable: true.
+    // Real evidence failures (wrong PR, no referral binding) remain 422.
+    const status = verified.statusCode ?? (verified.retryable ? 503 : 422);
+    return json({ error: verified.reason, retryable: verified.retryable }, status);
+  }
 
   // 4) Sign the award payload, built here (never read from an RPC node). The recipient
   // redeems it on-chain; the contract refuses it after `expiresAt` (unix seconds, compared
@@ -162,7 +167,7 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
 async function verifyEvidence(
   ev: AttestEvidence,
   recipient: string,
-): Promise<{ ok: boolean; reason?: string }> {
+): Promise<{ ok: boolean; reason?: string; retryable?: boolean; statusCode?: number }> {
   // Invite-converts (growth quest): the person you invited has opened a profile AND been
   // vouched for — i.e. their Social score is > 0. Verified by reading the Reputation contract.
   if (ev.type === 'invite_converts') {
@@ -205,11 +210,36 @@ async function verifyEvidence(
     }
     const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
     if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-    const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${num}`, {
-      headers,
-    });
+    
+    let r: Response;
+    try {
+      r = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${num}`, {
+        headers,
+        signal: AbortSignal.timeout(8_000),
+      });
+    } catch (e) {
+      // Network error, DNS failure, timeout, or connection reset.
+      if (e instanceof Error && e.name === 'TimeoutError') {
+        return { ok: false, reason: 'github timed out — try again', retryable: true };
+      }
+      return { ok: false, reason: 'couldn't reach github right now — try again', retryable: true };
+    }
+
+    // Upstream rate limit (403 without GITHUB_TOKEN, or 429 with one) or outage (5xx).
+    if (r.status === 403 || r.status === 429 || r.status >= 500) {
+      return { ok: false, reason: `github unavailable (${r.status}) — try again`, retryable: true };
+    }
+
+    // Real evidence failures: PR doesn't exist (404) or isn't merged.
     if (!r.ok) return { ok: false, reason: `github ${r.status}` };
-    const pr = (await r.json()) as { merged?: boolean };
+    
+    let pr: { merged?: boolean };
+    try {
+      pr = (await r.json()) as { merged?: boolean };
+    } catch {
+      return { ok: false, reason: 'github returned invalid data — try again', retryable: true };
+    }
+    
     return pr.merged ? { ok: true } : { ok: false, reason: 'PR not merged' };
   }
 
@@ -223,7 +253,33 @@ async function verifyEvidence(
     }
     const invitedBy = await readInvitedBy(ev.ref);
     // A registry binding decides on its own; the classic marker is only read without one.
-    const marker = invitedBy === null && isGAddress(ev.ref) ? await readReferralMarker(ev.ref) : null;
+    let marker: string | null = null;
+    if (invitedBy === null && isGAddress(ev.ref)) {
+      const markerResult = await readReferralMarker(ev.ref);
+      
+      // Handle Horizon upstream failures with proper status codes and retryable flag.
+      if (markerResult.type === 'timeout') {
+        return { ok: false, reason: 'horizon timed out — try again', retryable: true, statusCode: 504 };
+      }
+      if (markerResult.type === 'network-error') {
+        return { ok: false, reason: 'couldn't reach horizon right now — try again', retryable: true, statusCode: 503 };
+      }
+      if (markerResult.type === 'upstream-error') {
+        return {
+          ok: false,
+          reason: `horizon unavailable (${markerResult.status}) — try again`,
+          retryable: true,
+          statusCode: 503,
+        };
+      }
+      if (markerResult.type === 'invalid-json') {
+        return { ok: false, reason: 'horizon returned invalid data — try again', retryable: true, statusCode: 503 };
+      }
+      
+      // Valid responses: marker found or no marker (both are fine, judgeReferral decides).
+      marker = markerResult.type === 'marker' ? markerResult.value : null;
+    }
+    
     return judgeReferral({ score, invitedBy, marker }, ev.ref, recipient);
   }
 
@@ -272,20 +328,55 @@ async function readInvitedBy(addr: string): Promise<string | null | undefined> {
 }
 
 /**
- * A classic account's `referral` manageData entry, decoded (Horizon): null when the account
- * or the entry doesn't exist, undefined when Horizon couldn't be read.
+ * A classic account's `referral` manageData entry, decoded (Horizon).
+ * Returns a discriminated result:
+ * - { type: 'marker', value: string } — marker found and decoded
+ * - { type: 'no-marker' } — account exists but has no referral marker, or 404 (no account)
+ * - { type: 'timeout' } — fetch timed out
+ * - { type: 'network-error' } — DNS failure, connection reset, or other network error
+ * - { type: 'upstream-error', status: number } — Horizon returned a non-2xx status (5xx, 429, etc.)
+ * - { type: 'invalid-json' } — Horizon returned 200 but the body wasn't valid JSON
  */
-async function readReferralMarker(ref: string): Promise<string | null | undefined> {
+async function readReferralMarker(
+  ref: string,
+): Promise<
+  | { type: 'marker'; value: string }
+  | { type: 'no-marker' }
+  | { type: 'timeout' }
+  | { type: 'network-error' }
+  | { type: 'upstream-error'; status: number }
+  | { type: 'invalid-json' }
+> {
+  let r: Response;
   try {
-    const r = await fetch(`${HORIZON}/accounts/${ref}`);
-    if (r.status === 404) return null;
-    if (!r.ok) return undefined;
-    const acct = (await r.json()) as { data?: Record<string, string> };
-    const raw = acct.data?.[REFERRAL_MARKER_KEY];
-    return raw ? decodeDataEntry(raw) : null;
-  } catch {
-    return undefined;
+    r = await fetch(`${HORIZON}/accounts/${ref}`, {
+      signal: AbortSignal.timeout(8_000),
+    });
+  } catch (e) {
+    // Timeout gets special handling for 504.
+    if (e instanceof Error && e.name === 'TimeoutError') {
+      return { type: 'timeout' };
+    }
+    // DNS failure, connection reset, or other network error.
+    return { type: 'network-error' };
   }
+
+  // Account doesn't exist — that's a valid "no marker" answer.
+  if (r.status === 404) return { type: 'no-marker' };
+  
+  // Upstream outage or rate limit — report the status so the caller can return 502/503.
+  if (!r.ok) return { type: 'upstream-error', status: r.status };
+
+  let acct: { data?: Record<string, string> };
+  try {
+    acct = (await r.json()) as { data?: Record<string, string> };
+  } catch {
+    // Invalid JSON from Horizon.
+    return { type: 'invalid-json' };
+  }
+
+  const raw = acct.data?.[REFERRAL_MARKER_KEY];
+  return raw ? { type: 'marker', value: decodeDataEntry(raw) } : { type: 'no-marker' };
 }
 
 /**

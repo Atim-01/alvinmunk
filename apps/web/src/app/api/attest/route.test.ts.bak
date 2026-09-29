@@ -267,16 +267,17 @@ describe('POST /api/attest referral_tx via the registry invite binding', () => {
     });
   });
 
-  it('503 with retryable when Horizon read fails (issue #173 fix)', async () => {
+  it('reports a Horizon read failure distinctly from having no binding at all', async () => {
     // invited_by resolves to null (no registry binding); the manageData fallback then
-    // hits Horizon, which returns a non-404 error — must now be 503 with retryable, not 422.
+    // hits Horizon, which returns a non-404 error — that must read as "couldn't read",
+    // not be folded into "no referral binding found".
     fetchSpy.mockResolvedValue(new Response('rate limited', { status: 503 }));
     simulateSpy.mockResolvedValueOnce(score(5)).mockResolvedValueOnce(sim(null));
     const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
-    expect(res.status).toBe(503);
-    const body = (await res.json()) as { error: string; retryable?: boolean };
-    expect(body.error).toMatch(/horizon unavailable.*503/i);
-    expect(body.retryable).toBe(true);
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      error: 'couldn’t read the referred account right now — try again',
+    });
   });
 
   // ── issue #173: Horizon timeouts, network failures and upstream outages ───
