@@ -53,6 +53,23 @@ function refeeDeploy(xdrStr: string): string {
   return rebuilt.toXDR();
 }
 
+/**
+ * Typed errors from @openzeppelin/relayer-plugin-channels that we need to handle distinctly.
+ */
+interface RelayerErrorDetails {
+  statusCode?: number;
+  message?: string;
+  [key: string]: unknown;
+}
+
+interface RelayerError extends Error {
+  errorDetails?: RelayerErrorDetails;
+}
+
+function isRelayerError(e: unknown): e is RelayerError {
+  return e instanceof Error && 'errorDetails' in e;
+}
+
 export const POST = withRoute('POST /api/passkey-send', async (req: Request): Promise<Response> => {
   const relayerUrl = process.env.PASSKEY_RELAYER_URL;
   const relayerApiKey = process.env.PASSKEY_RELAYER_API_KEY;
@@ -70,25 +87,119 @@ export const POST = withRoute('POST /api/passkey-send', async (req: Request): Pr
     return json({ error: 'Body must be valid JSON.' }, 400);
   }
 
+  // Validate input shape before calling relayer
+  if (typeof body.func === 'string' && Array.isArray(body.auth)) {
+    // Soroban contract call: validate auth array contains only strings
+    if (!body.auth.every((a) => typeof a === 'string')) {
+      return json({ error: 'auth must be an array of base64 XDR strings.' }, 400);
+    }
+    // Validate func is valid base64 XDR (will throw if malformed)
+    try {
+      xdr.SorobanAuthorizedFunction.fromXDR(body.func, 'base64');
+    } catch (e) {
+      console.error('[passkey-send] Invalid func XDR:', e instanceof Error ? e.message : String(e));
+      return json({ error: 'func must be valid base64-encoded SorobanAuthorizedFunction XDR.' }, 400);
+    }
+    // Validate each auth entry is valid XDR
+    for (let i = 0; i < body.auth.length; i++) {
+      try {
+        xdr.SorobanAuthorizationEntry.fromXDR(body.auth[i], 'base64');
+      } catch (e) {
+        console.error(`[passkey-send] Invalid auth[${i}] XDR:`, e instanceof Error ? e.message : String(e));
+        return json({ error: `auth[${i}] must be valid base64-encoded SorobanAuthorizationEntry XDR.` }, 400);
+      }
+    }
+  } else if (typeof body.xdr === 'string') {
+    // Deploy transaction: validate and decode XDR before calling relayer
+    try {
+      const env = xdr.TransactionEnvelope.fromXDR(body.xdr, 'base64');
+      const v1 = env.v1();
+      if (!v1) {
+        return json({ error: 'xdr must be a v1 transaction envelope.' }, 400);
+      }
+      const tx = v1.tx();
+      const sorobanData = tx.ext().sorobanData();
+      if (!sorobanData) {
+        return json({ error: 'xdr must be a Soroban transaction with sorobanData.' }, 400);
+      }
+    } catch (e) {
+      console.error('[passkey-send] Invalid xdr:', e instanceof Error ? e.message : String(e));
+      return json({ error: 'xdr must be valid base64-encoded TransactionEnvelope XDR.' }, 400);
+    }
+  } else {
+    return json({ error: 'Body must be { func, auth } or { xdr }.' }, 400);
+  }
+
+  // Call the relayer with validated input
   try {
     const client = new ChannelsClient({ baseUrl: relayerUrl, apiKey: relayerApiKey });
     let result: { hash?: string | null };
+    
     if (typeof body.func === 'string' && Array.isArray(body.auth)) {
-      // Soroban contract call (the common path) — channel-sourced, relayer handles fees.
       result = await client.submitSorobanTransaction({
         func: body.func,
         auth: body.auth as string[],
       });
     } else if (typeof body.xdr === 'string') {
-      // One-time smart-wallet deploy — fee-fix + re-sign, then submit the complete tx.
       result = await client.submitTransaction({ xdr: refeeDeploy(body.xdr) });
     } else {
+      // Already validated above, but TypeScript needs this
       return json({ error: 'Body must be { func, auth } or { xdr }.' }, 400);
     }
-    if (!result?.hash) throw new Error('relayer returned no tx hash');
+
+    if (!result?.hash) {
+      console.error('[passkey-send] Relayer returned no tx hash:', result);
+      throw new Error('relayer returned no tx hash');
+    }
+    
+    console.log('[passkey-send] Success:', { hash: result.hash });
     return json({ hash: result.hash }, 200);
   } catch (e) {
+    // Map relayer errors to appropriate status codes
+    if (isRelayerError(e)) {
+      const details = e.errorDetails;
+      const errName = e.constructor.name;
+      
+      console.error('[passkey-send] Relayer error:', {
+        name: errName,
+        message: e.message,
+        details,
+      });
+
+      // PluginTransportError: network/HTTP failure (statusCode present)
+      if (errName === 'PluginTransportError' && details?.statusCode) {
+        const statusCode = details.statusCode;
+        // Map upstream status: 5xx → 502 (bad gateway), timeout-like → 504
+        const ourStatus = statusCode >= 500 && statusCode < 600 ? 502 : 504;
+        return json(
+          { error: `Relayer unreachable (upstream ${statusCode}).`, code: 'RELAYER_TRANSPORT_ERROR' },
+          ourStatus,
+        );
+      }
+
+      // PluginExecutionError: relayer rejected (simulation failure, invalid auth, fee limit, etc.)
+      if (errName === 'PluginExecutionError') {
+        return json(
+          {
+            error: details?.message || e.message || 'Relayer rejected the transaction.',
+            code: 'RELAYER_EXECUTION_ERROR',
+          },
+          422,
+        );
+      }
+
+      // PluginUnexpectedError: malformed response from relayer
+      if (errName === 'PluginUnexpectedError') {
+        return json(
+          { error: 'Relayer returned malformed response.', code: 'RELAYER_UNEXPECTED_ERROR' },
+          502,
+        );
+      }
+    }
+
+    // Unknown error (not a typed relayer error, or XDR processing failed in refeeDeploy)
     const msg = e instanceof Error ? e.message : 'relayer submit failed';
-    return json({ error: msg }, 502);
+    console.error('[passkey-send] Unexpected error:', e);
+    return json({ error: msg, code: 'UNKNOWN_ERROR' }, 502);
   }
 });
